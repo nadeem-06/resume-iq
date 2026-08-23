@@ -10,6 +10,8 @@ from transformers import (
     AutoModelForTokenClassification,
 )
 
+from llm_matcher import get_llm_match
+
 MODEL_PATH = "my_resume_bert"
 
 # ------------------------------------------------------------
@@ -774,3 +776,17 @@ def score_resume(resume: dict, job: dict):
     }
 
     return round(score, 2), breakdown
+
+# ------------------------------------------------------------
+# COMBINED RULE-BASED + LLM MATCH REPORT
+# ------------------------------------------------------------
+def get_full_match_report(resume_text: str, jd_text: str, resume: dict, job: dict):
+    """
+    Runs the existing rule-based scoring AND the Gemini semantic match,
+    and returns both. The rule-based score/breakdown is unchanged from
+    score_resume() — this just appends the LLM result alongside it, so
+    nothing about existing behavior is altered if the LLM call fails.
+    """
+    rule_score, breakdown = score_resume(resume, job)
+    llm_result = get_llm_match(resume_text, jd_text)
+    return rule_score, breakdown, llm_result
