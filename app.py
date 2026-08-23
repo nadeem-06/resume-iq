@@ -9,8 +9,11 @@ from backend import (
     extract_resume_text,
     extract_resume_entities,
     parse_job_description,
-    score_resume,
+    get_full_match_report,
 )
+from db import init_db, save_screening, get_all_screenings, get_screening_by_id
+
+init_db()
 
 # ─────────────────────────────────────────────
 #  PAGE CONFIG
@@ -19,7 +22,7 @@ st.set_page_config(
     page_title="ResumeIQ — AI Resume Screener",
     page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ─────────────────────────────────────────────
@@ -56,8 +59,14 @@ html, body, [data-testid="stAppViewContainer"] {
 [data-testid="stHeader"] { background: transparent !important; }
 [data-testid="stSidebar"] { background: var(--surface) !important; }
 
-/* Hide default streamlit chrome */
+/* Hide default streamlit chrome, but keep the sidebar toggle arrow visible */
 #MainMenu, footer, header { visibility: hidden; }
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapsedControl"] {
+    visibility: visible !important;
+    display: block !important;
+}
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
@@ -552,22 +561,45 @@ st.markdown("""
 
 st.markdown("---")
 
+# ── Past Screenings (from SQLite) — main-page panel, not sidebar ──
+with st.expander("📚 Past Screenings", expanded=False):
+    past = get_all_screenings(limit=25)
+    if not past:
+        st.caption("No screenings yet — run one to see history here.")
+    else:
+        for row in past:
+            name = row["candidate_name"] or "Unknown candidate"
+            rscore = row["rule_score"]
+            lscore = row["llm_score"]
+            st.markdown(
+                f'<div class="info-row"><span class="info-val">'
+                f'<b>{name}</b> &nbsp;·&nbsp; rule {rscore} / llm {lscore or "—"} '
+                f'&nbsp;·&nbsp; {row["llm_recommendation"] or "—"} '
+                f'&nbsp;·&nbsp; <span style="color:#64748b;font-size:0.8rem">{row["created_at"]}</span>'
+                f'</span></div>',
+                unsafe_allow_html=True,
+            )
+
+st.markdown("---")
+
 # ── Input area ──────────────────────────────
 col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
-    st.markdown('<div class="card-title">📄 Upload Resume</div>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader(
-        "Drop your PDF here",
+    st.markdown('<div class="card-title">📄 Upload Resume(s)</div>', unsafe_allow_html=True)
+    uploaded_files = st.file_uploader(
+        "Drop one or more PDFs here",
         type=["pdf"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
-    if uploaded_file:
-        st.markdown(
-            f'<div style="color:#34d399;font-family:\'DM Mono\',monospace;font-size:0.8rem;margin-top:0.4rem;">'
-            f'✓ {uploaded_file.name} &nbsp;·&nbsp; {uploaded_file.size/1024:.1f} KB</div>',
-            unsafe_allow_html=True,
-        )
+    if uploaded_files:
+        for f in uploaded_files:
+            st.markdown(
+                f'<div style="color:#34d399;font-family:\'DM Mono\',monospace;font-size:0.8rem;margin-top:0.4rem;">'
+                f'✓ {f.name} &nbsp;·&nbsp; {f.size/1024:.1f} KB</div>',
+                unsafe_allow_html=True,
+            )
 
 with col_right:
     st.markdown('<div class="card-title">📝 Job Description</div>', unsafe_allow_html=True)
@@ -582,15 +614,115 @@ st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
 _, btn_col, _ = st.columns([1, 2, 1])
 with btn_col:
-    analyze_clicked = st.button("🚀 Analyze Resume", type="primary")
+    analyze_clicked = st.button("🚀 Analyze Resume(s)", type="primary")
 
 st.markdown("---")
 
 # ── Analysis ────────────────────────────────
 if analyze_clicked:
-    if not uploaded_file or not jd_text.strip():
-        st.warning("⚠️  Please upload a PDF resume **and** enter a job description before analyzing.")
+    if not uploaded_files or not jd_text.strip():
+        st.warning("⚠️  Please upload at least one PDF resume **and** enter a job description before analyzing.")
         st.stop()
+
+    # ══════════════════════════════════════════
+    #  BATCH MODE — multiple resumes: rank & shortlist
+    # ══════════════════════════════════════════
+    if len(uploaded_files) > 1:
+        job_data = parse_job_description(jd_text)
+        batch_results = []
+
+        progress_bar = st.progress(0, text=f"Screening 0 / {len(uploaded_files)} candidates…")
+
+        for idx, f in enumerate(uploaded_files, start=1):
+            progress_bar.progress(
+                (idx - 1) / len(uploaded_files),
+                text=f"Screening {f.name} ({idx} / {len(uploaded_files)})…",
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(f.read())
+                tmp_path = tmp.name
+
+            r_text = extract_resume_text(tmp_path)
+            r_data = extract_resume_entities(r_text)
+            r_score, r_breakdown, r_llm = get_full_match_report(r_text, jd_text, r_data, job_data)
+            os.unlink(tmp_path)
+
+            save_screening(r_text, r_data, jd_text, job_data, r_score, r_breakdown, r_llm)
+
+            llm_score_10 = r_llm.get("llm_score")
+            composite = (
+                (r_score + llm_score_10 * 10) / 2
+                if r_llm.get("available") and llm_score_10 is not None
+                else r_score
+            )
+
+            batch_results.append({
+                "file_name": f.name,
+                "name": r_data.get("name") or f.name,
+                "rule_score": r_score,
+                "llm_score": llm_score_10,
+                "recommendation": r_llm.get("recommendation") or "—",
+                "justification": r_llm.get("justification") or "",
+                "key_strengths": r_llm.get("key_strengths", []),
+                "key_gaps": r_llm.get("key_gaps", []),
+                "matched_skills": r_breakdown["matched_skills"],
+                "missing_skills": r_breakdown["missing_skills"],
+                "composite": round(composite, 1),
+                })
+
+        progress_bar.progress(1.0, text=f"Done — screened {len(uploaded_files)} candidates.")
+        batch_results.sort(key=lambda x: x["composite"], reverse=True)
+
+        st.markdown('<div class="section-label">🏆 Candidate Ranking</div>', unsafe_allow_html=True)
+        st.caption(
+            "Ranked by a composite of the rule-based score (0–100) and the LLM semantic score (1–10, scaled to 100)."
+        )
+
+        for i, cand in enumerate(batch_results, start=1):
+            rank_badge = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
+            shortlisted = cand["rule_score"] >= 70 or (cand["llm_score"] or 0) >= 7
+            verdict = '<span class="verdict-pill verdict-yes">✓ Shortlisted</span>' if shortlisted else '<span class="verdict-pill verdict-maybe">~ Review</span>'
+
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.8rem;">'
+                f'<div style="font-family:\'Syne\',sans-serif;font-size:1.15rem;font-weight:700;">'
+                f'{rank_badge} &nbsp;{cand["name"]}</div>'
+                f'<div style="display:flex;gap:0.8rem;align-items:center;">'
+                f'<span style="font-family:\'DM Mono\',monospace;color:#64748b;font-size:0.85rem;">'
+                f'rule: <b style="color:#38bdf8">{cand["rule_score"]}/100</b> · '
+                f'llm: <b style="color:#818cf8">{cand["llm_score"] if cand["llm_score"] is not None else "—"}/10</b></span>'
+                f'{verdict}</div></div>',
+                unsafe_allow_html=True,
+            )
+            with st.expander("View justification & skill match"):
+                if cand["justification"]:
+                    st.markdown(
+                        f'<p style="color:#e2e8f0;font-size:0.9rem;line-height:1.6;">{cand["justification"]}</p>',
+                        unsafe_allow_html=True,
+                    )
+                jc1, jc2 = st.columns(2, gap="large")
+                with jc1:
+                    st.markdown('<div class="card-title">Key Strengths</div>', unsafe_allow_html=True)
+                    render_pills(cand["key_strengths"], "pill-match")
+                    st.markdown('<div class="card-title" style="margin-top:0.9rem;">Matched Skills</div>', unsafe_allow_html=True)
+                    render_pills(cand["matched_skills"], "pill-match")
+                with jc2:
+                    st.markdown('<div class="card-title">Key Gaps</div>', unsafe_allow_html=True)
+                    render_pills(cand["key_gaps"], "pill-miss")
+                    st.markdown('<div class="card-title" style="margin-top:0.9rem;">Missing Skills</div>', unsafe_allow_html=True)
+                    render_pills(cand["missing_skills"], "pill-miss")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.caption(f"All {len(batch_results)} screenings saved to the database. Upload a single resume instead for the full detailed dashboard view.")
+        st.stop()
+
+    # ══════════════════════════════════════════
+    #  SINGLE MODE — one resume: full detailed dashboard
+    # ══════════════════════════════════════════
+    uploaded_file = uploaded_files[0]
 
     with st.spinner("Running NLP pipeline — extracting entities, matching skills, computing metrics…"):
         # Save PDF to temp file
@@ -601,8 +733,16 @@ if analyze_clicked:
         resume_text  = extract_resume_text(tmp_path)
         resume_data  = extract_resume_entities(resume_text)
         job_data     = parse_job_description(jd_text)
-        final_score, breakdown = score_resume(resume_data, job_data)
+        final_score, breakdown, llm_result = get_full_match_report(
+            resume_text, jd_text, resume_data, job_data
+        )
         os.unlink(tmp_path)
+
+        # Persist this screening to SQLite
+        save_screening(
+            resume_text, resume_data, jd_text, job_data,
+            final_score, breakdown, llm_result,
+        )
 
     # Enrich metrics with raw exp values for radar chart
     metrics = breakdown["evaluation_metrics"]
@@ -647,6 +787,48 @@ if analyze_clicked:
         st.markdown('<div class="card-title">Performance Radar</div>', unsafe_allow_html=True)
         st.plotly_chart(make_radar(metrics), use_container_width=True, config={"displayModeBar": False})
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════
+    #  ROW 1.5 — AI Justification (LLM semantic match)
+    # ══════════════════════════════════════════
+    st.markdown('<div class="section-label">🤖 AI Semantic Match</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+
+    if llm_result.get("available"):
+        rec = llm_result.get("recommendation", "")
+        rec_class = {
+            "Strong Fit": "verdict-yes",
+            "Moderate Fit": "verdict-maybe",
+            "Weak Fit": "verdict-no",
+        }.get(rec, "verdict-maybe")
+
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.9rem;">'
+            f'<span style="font-family:\'Syne\',sans-serif;font-size:1.6rem;font-weight:800;color:#38bdf8;">'
+            f'{llm_result.get("llm_score", "—")}/10</span>'
+            f'<span class="verdict-pill {rec_class}">{rec or "—"}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<p style="color:#e2e8f0;font-size:0.92rem;line-height:1.6;">{llm_result.get("justification", "")}</p>',
+            unsafe_allow_html=True,
+        )
+
+        jc1, jc2 = st.columns(2, gap="large")
+        with jc1:
+            st.markdown('<div class="card-title">Key Strengths</div>', unsafe_allow_html=True)
+            render_pills(llm_result.get("key_strengths", []), "pill-match")
+        with jc2:
+            st.markdown('<div class="card-title">Key Gaps</div>', unsafe_allow_html=True)
+            render_pills(llm_result.get("key_gaps", []), "pill-miss")
+    else:
+        st.warning(
+            f"⚠️ AI semantic match unavailable ({llm_result.get('error', 'unknown error')}). "
+            f"Showing rule-based score only. Set the GEMINI_API_KEY environment variable to enable this."
+        )
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ══════════════════════════════════════════
     #  ROW 2 — Evaluation Metrics Bar Chart
