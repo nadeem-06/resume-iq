@@ -1,148 +1,226 @@
-# ResumeIQ — AI Resume Screener
+# 📄 ResumeIQ — AI Resume Screener
 
-Parses a resume, matches it against a job description, and scores the fit
-using both a rule-based weighted formula and an LLM semantic evaluation.
+ResumeIQ reads PDF resumes, matches them against a job description, and scores each candidate two ways: a transparent **rule-based score** and an **LLM semantic evaluation** with a written justification. Upload one resume for a detailed report, or several to rank and shortlist candidates.
 
-## Architecture
+---
 
-```
-                ┌────────────────────┐
-                │   Resume (PDF)      │
-                └─────────┬───────────┘
-                           │  pdfplumber
-                           ▼
-                ┌────────────────────┐
-                │  Text Extraction    │  backend.py: extract_resume_text()
-                └─────────┬───────────┘
-                           │
-                           ▼
-                ┌────────────────────┐
-                │  Entity Extraction  │  backend.py: extract_resume_entities()
-                │  - BERT NER model   │  (loads my_resume_bert/ if present)
-                │    (if trained model│
-                │    folder present)  │
-                │  - else: regex /    │
-                │    keyword fallback │
-                └─────────┬───────────┘
-                           │  name, email, phone, skills,
-                           │  companies, education, experience
-                           ▼
-        ┌──────────────────┴───────────────────┐
-        ▼                                       ▼
-┌───────────────────┐                 ┌───────────────────────┐
-│ Rule-based Scoring │                 │  LLM Semantic Match    │
-│ backend.py:        │                 │  llm_matcher.py:        │
-│ score_resume()      │                 │  get_llm_match()        │
-│ Skills 60% ·         │                 │  Gemini 2.0 Flash       │
-│ Experience 25% ·     │                 │  → 1-10 score +          │
-│ Education 15%        │                 │    justification +       │
-│                       │                 │    strengths/gaps        │
-└──────────┬────────────┘                 └────────────┬─────────────┘
-           │                                            │
-           └───────────────────┬────────────────────────┘
-                                ▼
-                  backend.py: get_full_match_report()
-                                │
-                                ▼
-                  ┌─────────────────────────┐
-                  │   SQLite (db.py)          │
-                  │   Every screening is       │
-                  │   persisted: resume data,  │
-                  │   JD, both scores           │
-                  └──────────────┬─────────────┘
-                                 │
-                 ┌───────────────┴────────────────┐
-                 ▼                                 ▼
-     ┌─────────────────────┐          ┌─────────────────────────┐
-     │  FastAPI (api.py)     │          │  Streamlit UI (app.py)   │
-     │  REST endpoints,       │          │  Dashboard, charts,       │
-     │  Swagger docs at        │          │  past-screenings sidebar  │
-     │  /docs                  │          │  (optional per spec)      │
-     └─────────────────────┘          └─────────────────────────┘
-```
+## 📑 Table of Contents
 
-## Why two scoring methods?
+- [Features](#-features)
+- [Tech Stack](#-tech-stack)
+- [How It Works](#-how-it-works)
+- [Scoring](#-scoring)
+- [Project Structure](#-project-structure)
+- [Getting Started](#-getting-started)
+- [API Reference](#-api-reference)
+- [Database](#-database)
+- [Deployment](#-deployment)
 
-- **Rule-based (`score_resume`)** — deterministic, fast, explainable. Good
-  for exact skill/keyword coverage and a reproducible numeric baseline.
-- **LLM (`get_llm_match`)** — reads the *actual* resume and JD text and
-  judges fit semantically (transferable skills, seniority, phrasing that
-  regex can't catch), and writes a plain-language justification a recruiter
-  can read directly.
+---
 
-Both are shown side by side so neither one is a black box — you can see
-where they agree and where they diverge.
+## ✨ Features
 
-## The LLM prompt
+- **PDF resume parsing** with `pdfplumber`
+- **Entity extraction**: name, email, phone, skills, companies, education and years of experience, using a fine-tuned BERT NER model with an automatic regex/keyword fallback
+- **Job description parsing** for required skills and minimum experience
+- **Dual scoring**: a reproducible rule-based score (0–100) next to an LLM fit score (1–10)
+- **LLM insights**: justification, key strengths, key gaps and a Strong / Moderate / Weak Fit recommendation
+- **Batch mode**: upload several resumes to get a ranked shortlist
+- **Interactive dashboard**: score gauge, breakdown bars, radar chart, skill donut, and matched / missing / extra skill tabs
+- **Evaluation metrics**: precision, recall, F1 and skill-match rate for skills
+- **Screening history** saved to SQLite
+- **REST API** with FastAPI and Swagger docs
+- **Graceful degradation**: if the LLM key is missing or the call fails, the rule-based score and the rest of the app keep working
 
-Sent to Gemini (`llm_matcher.py`), truncated to keep token usage low
-(resume: 6000 chars, JD: 3000 chars):
+---
 
-```
-You are an expert technical recruiter. Compare the following resume
-with the job description and rate the candidate's fit on a scale of 1-10,
-with clear justification.
+## 🧰 Tech Stack
 
-Respond with ONLY a valid JSON object (no markdown fences, no extra text)
-in exactly this shape:
-
-{
-  "llm_score": <integer 1-10>,
-  "justification": "<2-4 sentence explanation of the rating>",
-  "key_strengths": ["<short phrase>", "<short phrase>", "<short phrase>"],
-  "key_gaps": ["<short phrase>", "<short phrase>"],
-  "recommendation": "<one of: Strong Fit, Moderate Fit, Weak Fit>"
-}
-
-RESUME:
-"""
-{resume_text}
-"""
-
-JOB DESCRIPTION:
-"""
-{jd_text}
-"""
-```
-
-The response is parsed as strict JSON (code fences stripped if the model
-adds them). If the API key is missing or the call fails for any reason,
-`get_llm_match()` returns `"available": False` with an error message —
-the rule-based score and the rest of the app keep working regardless.
-
-## Project structure
-
-| File | Purpose |
+| Layer | Technologies |
 |---|---|
-| `backend.py` | PDF text extraction, BERT/regex entity extraction, rule-based scoring, and `get_full_match_report()` which combines rule-based + LLM results |
-| `llm_matcher.py` | Gemini API call for semantic match scoring + justification |
-| `db.py` | SQLite persistence — every screening (resume, JD, both scores) is saved |
-| `api.py` | FastAPI REST backend — `/api/screen`, `/api/screenings`, `/api/parse-jd` |
-| `app.py` | Streamlit dashboard (optional frontend) — charts, tabs, past-screenings sidebar |
-| `datasets.json` | Training/reference data used for the BERT NER model |
+| **UI** | Streamlit, Plotly |
+| **API** | FastAPI, Uvicorn |
+| **NLP / ML** | Hugging Face Transformers (BERT token classification), PyTorch (CPU) |
+| **LLM** | Groq API (`openai/gpt-oss-20b`) |
+| **PDF parsing** | pdfplumber |
+| **Storage** | SQLite |
+| **Language** | Python 3.11 |
+| **Hosting** | Render |
 
-## Setup
+---
 
-```bash
-pip install -r requirements.txt
-export GEMINI_API_KEY="your-key-here"   # free key: https://aistudio.google.com/apikey
+## ⚙️ How It Works
+
+```mermaid
+flowchart TD
+    A[Resume PDF] -->|pdfplumber| B[Text extraction]
+    B --> C{BERT model<br/>folder present?}
+    C -->|Yes| D[BERT NER extraction]
+    C -->|No| E[Regex / keyword extraction]
+    D --> F[Structured resume data]
+    E --> F
+    J[Job description] --> K[JD parsing:<br/>skills + min experience]
+    F --> R[Rule-based score]
+    K --> R
+    B --> L[LLM semantic match<br/>Groq]
+    J --> L
+    R --> M[Full match report]
+    L --> M
+    M --> DB[(SQLite)]
+    M --> UI[Streamlit dashboard]
+    M --> API[FastAPI REST API]
 ```
 
-**Run the Streamlit dashboard:**
+1. **Extract**: the PDF is converted to plain text.
+2. **Understand**: entities are pulled out with the BERT model (if available) or the fallback extractor.
+3. **Parse the JD**: required skills and minimum years of experience are identified.
+4. **Score**: the rule-based scorer and the LLM evaluate the candidate independently.
+5. **Report & store**: both results are shown side by side and saved to the database.
+
+---
+
+## 📊 Scoring
+
+### Rule-based score (0–100)
+
+| Component | Weight | How it's calculated |
+|---|---|---|
+| **Skills** | 60 | Share of the JD's required skills found in the resume |
+| **Experience** | 25 | Candidate years ÷ required years (capped at full marks) |
+| **Education** | 15 | Awarded when education details are found |
+
+It is deterministic, fast and explainable, which makes it a reliable baseline for exact skill coverage.
+
+### LLM score (1–10)
+
+The resume (first 6,000 characters) and JD (first 3,000 characters) are sent to the LLM with a recruiter-style prompt. The model returns strict JSON:
+
+```json
+{
+  "llm_score": 7,
+  "justification": "2–4 sentence explanation",
+  "key_strengths": ["...", "..."],
+  "key_gaps": ["...", "..."],
+  "recommendation": "Strong Fit | Moderate Fit | Weak Fit"
+}
+```
+
+The LLM catches things rules can't, such as transferable skills, seniority and different phrasing for the same skill.
+
+### Why both?
+
+Showing both scores together means neither is a black box. You can see where they agree and where they differ.
+
+---
+
+## 📁 Project Structure
+
+```
+resume-iq/
+├── app.py               # Streamlit dashboard (single + batch screening)
+├── api.py               # FastAPI REST backend
+├── backend.py           # PDF extraction, entity extraction, JD parsing, scoring
+├── llm_matcher.py       # Groq LLM call, prompt and JSON parsing
+├── db.py                # SQLite persistence for screenings
+├── datasets.json        # Annotated resume dataset (JSON Lines) for NER training
+├── requirements.txt     # Python dependencies
+├── runtime.txt          # Python version for deployment
+├── render.yaml          # Render deployment config
+└── .streamlit/
+    └── config.toml      # Streamlit server settings
+```
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Python 3.11
+- A free [Groq API key](https://console.groq.com/keys)
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/nadeem-06/resume-iq.git
+cd resume-iq
+```
+
+### 2. Create a virtual environment and install dependencies
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 3. Set your API key
+```bash
+export GROQ_API_KEY="your-key-here"     # Windows (PowerShell): $env:GROQ_API_KEY="your-key-here"
+```
+
+### 4. Run the dashboard
 ```bash
 streamlit run app.py
 ```
+Open `http://localhost:8501`.
 
-**Run the API instead (or alongside):**
+### 5. Run the API (optional)
 ```bash
+pip install fastapi uvicorn python-multipart
 uvicorn api:app --reload --port 8000
-# interactive docs: http://localhost:8000/docs
+```
+Interactive docs are at `http://localhost:8000/docs`.
+
+### Optional: BERT NER model
+Place a trained token-classification model in a folder named `my_resume_bert/` in the project root. If the folder isn't there, the app automatically uses the regex/keyword extractor. It still works, with slightly lower precision on unusual resume layouts.
+
+---
+
+## 📡 API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/` | Health check |
+| POST | `/api/parse-jd` | Parse a job description. Form field: `jd_text` |
+| POST | `/api/screen` | Full screening pipeline. Form fields: `resume` (PDF file), `jd_text` |
+| GET | `/api/screenings?limit=25` | List recent screenings, newest first |
+| GET | `/api/screenings/{id}` | Get the full stored record for one screening |
+
+**Example**
+```bash
+curl -X POST http://localhost:8000/api/screen \
+  -F "resume=@resume.pdf" \
+  -F "jd_text=Looking for a Python developer with 2+ years of FastAPI experience"
 ```
 
-## Notes on the NER model
+The response includes `screening_id`, `resume_data`, `job_data`, `rule_score`, `breakdown` and `llm_result`.
 
-`extract_resume_entities()` looks for a trained BERT model folder at
-`my_resume_bert/`. If it's not present (e.g. not included in the repo due
-to size), extraction automatically falls back to the regex/keyword-based
-extractor — the app works either way, just with lower precision on
-unusual resume formats without the trained model.
+---
+
+## 🗄️ Database
+
+Screenings are saved to `resumeiq.db`, which is created automatically on first run. Each row stores:
+
+- Candidate name, email and phone
+- Resume text and extracted data
+- Job description and parsed requirements
+- Rule-based score and breakdown
+- LLM score, justification, recommendation and full result
+
+---
+
+## ☁️ Deployment
+
+The repo includes a `render.yaml` for one-click deployment on [Render](https://render.com):
+
+1. Create a new **Blueprint** on Render and connect this repository.
+2. Add `GROQ_API_KEY` as an environment variable.
+3. Deploy. The service runs `streamlit run app.py` on Render's assigned port.
+
+> Note: SQLite data on Render's free tier is not persistent across redeploys.
+
+---
+
+## 👤 Author
+
+**Nadeem** · [GitHub](https://github.com/nadeem-06)
+
+If you found this project useful, consider giving it a ⭐
